@@ -1,0 +1,15 @@
+# Trading symbol
+symbol: BTCUSDT
+
+# Directory where daily .db files are stored
+data_dir: data
+
+# Order book
+lob_depth: 50               # levels per side stored and snapshotted
+snapshot_interval_s: 0.1    # how often to push OB snapshot into storage queue (100ms)
+
+# Storage
+queue_maxsize: 10000         # asyncio.Queue bound; oldest dropped on overflow
+
+# REST polling
+ls_ratio_interval_s: 900    # long/short ratio poll interval (15 min)

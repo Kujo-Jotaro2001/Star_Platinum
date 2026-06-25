@@ -1,0 +1,2 @@
+1. Ошибка в self._n = len(ob_raw) - seq_len
+должно быть self._n = len(ob_raw) - seq_len + 1

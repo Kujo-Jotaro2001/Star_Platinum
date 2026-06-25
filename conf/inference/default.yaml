@@ -1,0 +1,4 @@
+checkpoint_path: null
+normalizer_stats_path: null
+device: auto
+warmup_action: NO_TRADE

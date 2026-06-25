@@ -1,0 +1,17 @@
+defaults:
+  - ingestion: default
+  - features: default
+  - model: default
+  - train: default
+  - historical: default
+  - signals: default
+  - risk: default
+  - inference: default
+  - _self_
+
+hydra:
+  run:
+    dir: .        # keep cwd unchanged — Hydra default of outputs/ breaks relative paths
+  output_subdir: null
+  job_logging:
+    disable_existing_loggers: false

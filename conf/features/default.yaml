@@ -1,0 +1,21 @@
+# Date range to process (override on CLI: features.start_date=2026-04-11)
+start_date: "2026-04-11"
+end_date: "2026-04-11"
+
+# Trade flow
+bucket_ms: 100              # trade flow bucket width, aligned to snapshot timestamps
+
+# Train / val / test split (chronological)
+train_ratio: 0.8
+val_ratio: 0.1              # test_ratio = 1 - train_ratio - val_ratio = 0.1
+
+# Rolling z-score normalizer
+normalizer_window: 500      # rolling window size for mean/std
+
+# Labels
+label_alpha: 0.001          # flat-band threshold: |ret| < alpha → class 1 (flat)
+label_horizons: [1, 5, 10]  # prediction horizons in snapshots
+
+# Context feature windows
+oi_history_window_ms: 3600000   # 1 hour — lookback for oi_change_pct_1h
+liq_window_ms: 60000            # 1 minute — rolling window for liquidation aggregates

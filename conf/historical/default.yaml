@@ -1,0 +1,9 @@
+# Historical data loader — downloads from quote-saver.bycsi.com
+# Source provides order book snapshots at 10ms cadence; we downsample to snapshot_interval_ms.
+
+start_date: "2026-03-01"
+end_date: "2026-04-01"
+base_url: "https://quote-saver.bycsi.com"
+
+# Target snapshot cadence after downsampling. Must be a multiple of 10 (source cadence).
+snapshot_interval_ms: 100

@@ -1,0 +1,12 @@
+seq_len: 100             # T — window length in snapshots
+ob_depth: 50             # K — LOB levels per side, must match cfg.ingestion.lob_depth
+in_features_flow: 9
+in_features_ctx: 17
+d_model: 128             # shared encoder output dim
+d_ctx: 64
+n_lob_blocks: 3          # CNN conv blocks in LOBEncoder
+flow_encoder: "gru"      # "gru" | "mamba"
+gru_layers: 2
+n_classes: 3
+dropout: 0.1
+use_ctx: true
