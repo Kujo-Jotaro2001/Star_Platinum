@@ -13,6 +13,12 @@ from bot.data.models import (
     TickerContext,
     Trade,
 )
+from bot.telemetry.types import DecisionRecord, OrderEvent
+
+Storable = (
+    OrderBookSnapshot | Trade | TickerContext | Liquidation | LongShortRatio
+    | DecisionRecord | OrderEvent
+)
 
 logger = structlog.get_logger()
 
@@ -71,10 +77,56 @@ CREATE TABLE IF NOT EXISTS long_short_ratio (
 )
 """
 
+DECISIONS_DDL = """
+CREATE TABLE IF NOT EXISTS decisions (
+    timestamp_ms      INTEGER NOT NULL,
+    status            TEXT    NOT NULL,
+    action            TEXT    NOT NULL,
+    horizon_index     INTEGER NOT NULL,
+    p_down            REAL    NOT NULL,
+    p_flat            REAL    NOT NULL,
+    p_up              REAL    NOT NULL,
+    predicted_class   INTEGER NOT NULL,
+    confidence        REAL    NOT NULL,
+    best_bid          TEXT,
+    best_ask          TEXT,
+    book_age_ms       INTEGER NOT NULL,
+    is_reset          INTEGER NOT NULL,
+    inference_us      INTEGER NOT NULL,
+    signal_reason     TEXT,
+    risk_reason       TEXT,
+    flow_z_max        REAL    NOT NULL,
+    flow_z_abs_mean   REAL    NOT NULL,
+    ctx_ticker_age_ms INTEGER NOT NULL,
+    ctx_liq_age_ms    INTEGER NOT NULL,
+    ctx_ls_age_ms     INTEGER NOT NULL,
+    class_changed     INTEGER NOT NULL
+)
+"""
+
+ORDER_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS order_events (
+    timestamp_ms   INTEGER NOT NULL,
+    order_link_id  TEXT    NOT NULL,
+    event          TEXT    NOT NULL,
+    side           TEXT    NOT NULL,
+    order_type     TEXT    NOT NULL,
+    reduce_only    INTEGER NOT NULL,
+    qty            TEXT    NOT NULL,
+    limit_price    TEXT,
+    fill_price     TEXT,
+    decision_price TEXT,
+    latency_ms     INTEGER,
+    exit_reason    TEXT
+)
+"""
+
 SNAPSHOTS_INDEX = "CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON snapshots(timestamp_ms)"
 TRADES_INDEX = "CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp_ms)"
 _TICKER_CONTEXT_INDEX = "CREATE INDEX IF NOT EXISTS idx_ticker_context_ts ON ticker_context(timestamp_ms)"
 _LIQUIDATIONS_INDEX = "CREATE INDEX IF NOT EXISTS idx_liquidations_ts ON liquidations(timestamp_ms)"
+DECISIONS_INDEX = "CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(timestamp_ms)"
+ORDER_EVENTS_INDEX = "CREATE INDEX IF NOT EXISTS idx_order_events_link ON order_events(order_link_id)"
 
 
 def _levels_to_json(levels: list) -> str:
@@ -100,17 +152,12 @@ class StorageWriter:
     ) -> None:
         self._data_dir = data_dir
         self._symbol = symbol
-        self._queue: asyncio.Queue[
-            OrderBookSnapshot | Trade | TickerContext | Liquidation | LongShortRatio
-        ] = asyncio.Queue(maxsize=queue_maxsize)
+        self._queue: asyncio.Queue[Storable] = asyncio.Queue(maxsize=queue_maxsize)
         self._db: aiosqlite.Connection | None = None
         self._current_date: str = ""
         self._dropped: int = 0
 
-    def put_nowait(
-        self,
-        item: OrderBookSnapshot | Trade | TickerContext | Liquidation | LongShortRatio,
-    ) -> None:
+    def put_nowait(self, item: Storable) -> None:
         """Non-blocking enqueue. Drops oldest item on backpressure."""
         if self._queue.full():
             try:
@@ -145,10 +192,7 @@ class StorageWriter:
                 break
             await self._write(item)
 
-    async def _write(
-        self,
-        item: OrderBookSnapshot | Trade | TickerContext | Liquidation | LongShortRatio,
-    ) -> None:
+    async def _write(self, item: Storable) -> None:
         db = await self._ensure_db(item.timestamp_ms)
         if isinstance(item, OrderBookSnapshot):
             await db.execute(
@@ -205,6 +249,39 @@ class StorageWriter:
                     item.collected_at_ms,
                 ),
             )
+        elif isinstance(item, DecisionRecord):
+            await db.execute(
+                """INSERT INTO decisions (
+                    timestamp_ms, status, action, horizon_index,
+                    p_down, p_flat, p_up, predicted_class, confidence,
+                    best_bid, best_ask, book_age_ms, is_reset, inference_us,
+                    signal_reason, risk_reason, flow_z_max, flow_z_abs_mean,
+                    ctx_ticker_age_ms, ctx_liq_age_ms, ctx_ls_age_ms, class_changed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    item.timestamp_ms, item.status, item.action, item.horizon_index,
+                    item.p_down, item.p_flat, item.p_up, item.predicted_class,
+                    item.confidence, _dec(item.best_bid), _dec(item.best_ask),
+                    item.book_age_ms, int(item.is_reset), item.inference_us,
+                    item.signal_reason, item.risk_reason, item.flow_z_max,
+                    item.flow_z_abs_mean, item.ctx_ticker_age_ms, item.ctx_liq_age_ms,
+                    item.ctx_ls_age_ms, int(item.class_changed),
+                ),
+            )
+        elif isinstance(item, OrderEvent):
+            await db.execute(
+                """INSERT INTO order_events (
+                    timestamp_ms, order_link_id, event, side, order_type,
+                    reduce_only, qty, limit_price, fill_price, decision_price,
+                    latency_ms, exit_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    item.timestamp_ms, item.order_link_id, item.event, item.side,
+                    item.order_type, int(item.reduce_only), str(item.qty),
+                    _dec(item.limit_price), _dec(item.fill_price),
+                    _dec(item.decision_price), item.latency_ms, item.exit_reason,
+                ),
+            )
         elif isinstance(item, LongShortRatio):
             await db.execute(
                 "INSERT OR IGNORE INTO long_short_ratio (timestamp_ms, buy_ratio, sell_ratio, collected_at_ms) VALUES (?, ?, ?, ?)",
@@ -235,10 +312,14 @@ class StorageWriter:
             await self._db.execute(_TICKER_CONTEXT_DDL)
             await self._db.execute(_LIQUIDATIONS_DDL)
             await self._db.execute(_LONG_SHORT_RATIO_DDL)
+            await self._db.execute(DECISIONS_DDL)
+            await self._db.execute(ORDER_EVENTS_DDL)
             await self._db.execute(SNAPSHOTS_INDEX)
             await self._db.execute(TRADES_INDEX)
             await self._db.execute(_TICKER_CONTEXT_INDEX)
             await self._db.execute(_LIQUIDATIONS_INDEX)
+            await self._db.execute(DECISIONS_INDEX)
+            await self._db.execute(ORDER_EVENTS_INDEX)
             await self._db.commit()
             self._current_date = date_str
             logger.info("storage.db_opened", path=str(path))

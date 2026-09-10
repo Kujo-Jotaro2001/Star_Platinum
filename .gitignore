@@ -7,3 +7,12 @@ __pycache__/
 .idea/
 dist/
 *.egg-info/
+.pytest_cache/
+# datasets, raw archives, hftbacktest feeds — anchored so bot/data/ stays tracked
+/data/
+# training/backtest artifacts and ad-hoc run logs, not source
+/models/
+/lightning_logs/
+/logs/
+*.ckpt
+/*.log

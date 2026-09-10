@@ -45,11 +45,18 @@ class ContextBuilder:
         self._ls_buy_ratio: float = 0.0
         self._ls_sell_ratio: float = 0.0
 
+        # Last time each source spoke. Forward-fill makes a dead stream look
+        # identical to a quiet one, so the age has to be tracked separately.
+        self._last_ticker_ms: int | None = None
+        self._last_liq_ms: int | None = None
+        self._last_ls_ms: int | None = None
+
     def update_ticker(self, row: dict) -> None:
         """Update forward-fill state from a ticker_context DB row.
 
         NULL/None fields are skipped (forward-fill preserves previous value).
         """
+        self._last_ticker_ms = row["timestamp_ms"]
         if row["mark_price"] is not None:
             self._mark_price = float(row["mark_price"])
         if row["index_price"] is not None:
@@ -69,6 +76,7 @@ class ContextBuilder:
 
     def update_liquidation(self, row: dict) -> None:
         """Push a liquidation event into the 1-minute sliding window."""
+        self._last_liq_ms = row["timestamp_ms"]
         self._liq_window.append((
             row["timestamp_ms"],
             row["side"],
@@ -77,8 +85,22 @@ class ContextBuilder:
 
     def update_long_short_ratio(self, row: dict) -> None:
         """Update forward-fill state for long/short ratio."""
+        self._last_ls_ms = row["timestamp_ms"]
         self._ls_buy_ratio = float(row["buy_ratio"])
         self._ls_sell_ratio = float(row["sell_ratio"])
+
+    def source_ages_ms(self, now_ms: int) -> tuple[int, int, int]:
+        """Age of the last update from ticker, liquidations and long/short ratio.
+
+        -1 means the source has never been seen. Every ticker-derived feature is
+        forward-filled indefinitely, so without this a stalled stream produces
+        confident predictions from frozen inputs and nothing looks wrong.
+        """
+        return (
+            _age(self._last_ticker_ms, now_ms),
+            _age(self._last_liq_ms, now_ms),
+            _age(self._last_ls_ms, now_ms),
+        )
 
     def snapshot(self, timestamp_ms: int) -> np.ndarray:
         """Produce 17 context features at the given snapshot timestamp.
@@ -153,3 +175,7 @@ class ContextBuilder:
             ],
             dtype=np.float32,
         )
+
+
+def _age(last_ms: int | None, now_ms: int) -> int:
+    return -1 if last_ms is None else now_ms - last_ms

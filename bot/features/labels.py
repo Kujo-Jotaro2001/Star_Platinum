@@ -14,6 +14,10 @@ def compute_labels(
       fut  = mean(mid_price[t : t+h])
       ret  = (fut - prev) / prev
 
+    Window means come from a prefix sum: a day is ~860k snapshots and the
+    horizons run to thousands of samples, so evaluating the windows one at a
+    time is quadratic enough to dominate the whole pipeline.
+
     Args:
         mid_prices: shape [N] float64
         is_reset: shape [N] bool — True on reconnect snapshots
@@ -23,7 +27,7 @@ def compute_labels(
     Returns:
         labels:     shape [N, H] int8 — 0=down, 1=flat, 2=up
         flat_mask:  shape [N, H] bool — True where label is flat
-        valid_mask: shape [N] bool — False for reset zones
+        valid_mask: shape [N] bool — False for reset zones and unusable edges
     """
     if horizons is None:
         horizons = [1, 5, 10]
@@ -36,37 +40,45 @@ def compute_labels(
     flat_mask = np.zeros((n, h_count), dtype=bool)
     valid_mask = np.ones(n, dtype=bool)
 
-    # Build reset zone mask: horizon snapshots before AND after each reset
-    reset_indices = np.where(is_reset)[0]
-    for idx in reset_indices:
-        start_before = max(0, idx - max_h)
-        end_after = min(n, idx + max_h + 1)
-        valid_mask[start_before:end_after] = False
+    # Reset zone: max_h snapshots either side of a reconnect.
+    for idx in np.where(is_reset)[0]:
+        valid_mask[max(0, idx - max_h):min(n, idx + max_h + 1)] = False
+
+    # The edges where the widest horizon has no room, matching the per-horizon
+    # checks the scalar form applied cumulatively.
+    valid_mask[:max_h] = False
+    if max_h > 0:
+        valid_mask[n - max_h + 1:] = False
+
+    prefix = np.concatenate(([0.0], np.cumsum(mid_prices, dtype=np.float64)))
+    t = np.arange(n)
 
     for hi, h in enumerate(horizons):
-        for t in range(n):
-            if not valid_mask[t]:
-                continue
-            # Need h points before and h points after
-            if t < h or t + h > n:
-                valid_mask[t] = False
-                continue
+        prev = np.zeros(n, dtype=np.float64)
+        fut = np.zeros(n, dtype=np.float64)
 
-            prev = mid_prices[t - h : t].mean()
-            fut = mid_prices[t : t + h].mean()
+        lo, hi_end = h, n - h + 1
+        if lo >= hi_end:
+            valid_mask[:] = False
+            continue
 
-            if prev == 0:
-                valid_mask[t] = False
-                continue
+        idx = t[lo:hi_end]
+        prev[idx] = (prefix[idx] - prefix[idx - h]) / h
+        fut[idx] = (prefix[idx + h] - prefix[idx]) / h
 
-            ret = (fut - prev) / prev
+        usable = valid_mask.copy()
+        usable[:lo] = False
+        usable[hi_end:] = False
+        usable &= prev != 0
+        valid_mask &= usable
 
-            if ret > alpha:
-                labels[t, hi] = 2
-            elif ret < -alpha:
-                labels[t, hi] = 0
-            else:
-                labels[t, hi] = 1
-                flat_mask[t, hi] = True
+        ret = np.zeros(n, dtype=np.float64)
+        np.divide(fut - prev, prev, out=ret, where=usable)
+
+        labels[usable & (ret > alpha), hi] = 2
+        labels[usable & (ret < -alpha), hi] = 0
+        flat = usable & (ret <= alpha) & (ret >= -alpha)
+        labels[flat, hi] = 1
+        flat_mask[flat, hi] = True
 
     return labels, flat_mask, valid_mask

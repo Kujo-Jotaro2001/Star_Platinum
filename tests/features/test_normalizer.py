@@ -91,3 +91,63 @@ class TestRollingNormalizer:
             result = norm.update_and_normalize(np.array([42.0]))
         # mean=42, std clamped to 1.0 → z-score=0
         assert result[0] == pytest.approx(0.0)
+
+
+class TestIncrementalMatchesExact:
+    """The running sums must agree with recomputing the window from scratch."""
+
+    def _exact(self, rows: np.ndarray, window: int, i: int) -> tuple[float, float]:
+        w = rows[max(0, i - window + 1):i + 1]
+        if len(w) < 2:
+            return (w[0][0] if len(w) else 0.0), 1.0
+        std = w[:, 0].std()
+        return w[:, 0].mean(), (std if std > 1e-10 else 1.0)
+
+    def test_matches_a_full_recompute_at_every_step(self) -> None:
+        rng = np.random.default_rng(0)
+        window = 50
+        rows = rng.standard_normal((400, 1)) * 5 + 100
+        norm = RollingNormalizer(num_features=1, window=window)
+        for i, row in enumerate(rows):
+            got = norm.update_and_normalize(row)
+            mean, std = self._exact(rows, window, i)
+            assert got[0] == pytest.approx((row[0] - mean) / std, rel=1e-4, abs=1e-4)
+
+    def test_survives_an_exact_refresh(self) -> None:
+        # cross the refresh boundary and confirm nothing shifts
+        rng = np.random.default_rng(1)
+        window = 64
+        n = 9000
+        rows = rng.standard_normal((n, 2)) * 3
+        norm = RollingNormalizer(num_features=2, window=window)
+        for row in rows:
+            norm.update_and_normalize(row)
+        tail = rows[-window:]
+        np.testing.assert_allclose(norm._mean, tail.mean(axis=0), rtol=1e-9, atol=1e-9)
+        np.testing.assert_allclose(norm._std, tail.std(axis=0), rtol=1e-9, atol=1e-9)
+
+    def test_multi_feature_windows_are_independent(self) -> None:
+        norm = RollingNormalizer(num_features=2, window=3)
+        for a, b in ((1.0, 100.0), (2.0, 200.0), (3.0, 300.0), (4.0, 400.0)):
+            norm.update_and_normalize(np.array([a, b]))
+        np.testing.assert_allclose(norm._mean, [3.0, 300.0])
+
+    def test_save_load_after_many_updates(self, tmp_path) -> None:
+        rng = np.random.default_rng(2)
+        norm = RollingNormalizer(num_features=3, window=32)
+        for _ in range(500):
+            norm.update_and_normalize(rng.standard_normal(3))
+        path = tmp_path / "s.npz"
+        norm.save(path)
+        loaded = RollingNormalizer.load(path)
+
+        probe = rng.standard_normal(3)
+        np.testing.assert_allclose(
+            norm.normalize_only(probe), loaded.normalize_only(probe)
+        )
+        # and continuing from the restored state must track the original
+        step = rng.standard_normal(3)
+        np.testing.assert_allclose(
+            norm.update_and_normalize(step), loaded.update_and_normalize(step),
+            rtol=1e-5, atol=1e-5,
+        )

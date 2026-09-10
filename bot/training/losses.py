@@ -1,13 +1,16 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
 
 class MultiHorizonLoss(nn.Module):
-    """Cross-entropy loss across multiple prediction horizons with flat_mask.
+    """Cross-entropy loss across multiple prediction horizons.
 
-    flat_mask positions are zeroed out before averaging.
+    Rows without a usable label — reset zones and the array edges — are zeroed
+    out before averaging. Flat is *not* excluded: it is one of the three classes
+    the model is asked to predict, and a model given no flat gradient cannot
+    learn to abstain, which leaves confidence thresholding as the only way to
+    decline a trade.
     Optional focal weighting: (1 - p_t)^gamma * CE.
     """
 
@@ -31,13 +34,13 @@ class MultiHorizonLoss(nn.Module):
         self,
         logits: Tensor,
         targets: Tensor,
-        flat_mask: Tensor,
+        valid: Tensor,
     ) -> Tensor:
         """
         Args:
-            logits:    [B, H, C]
-            targets:   [B, H] int64
-            flat_mask: [B, H] bool — True = flat, exclude from loss
+            logits:  [B, H, C]
+            targets: [B, H] int64
+            valid:   [B] or [B, H] bool — False = no usable label, exclude
         Returns:
             scalar loss
         """
@@ -59,5 +62,5 @@ class MultiHorizonLoss(nn.Module):
             ce = ce * focal_weight
 
         ce = ce.view(B, H)  # [B, H]
-        mask = ~flat_mask  # True = keep
+        mask = valid.view(B, 1).expand(B, H) if valid.dim() == 1 else valid
         return (ce * mask).sum() / mask.sum().clamp(min=1)

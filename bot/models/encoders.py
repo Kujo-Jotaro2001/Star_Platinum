@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 from torch import Tensor
 
@@ -12,7 +11,7 @@ class LOBEncoder(nn.Module):
     3 Conv2d blocks with asymmetric kernels:
       block 0: (1, 3) — spatial patterns across price levels only
       block 1-2: (3, 3) — spatio-temporal patterns
-    AdaptiveAvgPool2d collapses K dimension at the end.
+    The K dimension is collapsed by a mean at the end.
     """
 
     def __init__(
@@ -39,7 +38,6 @@ class LOBEncoder(nn.Module):
                 nn.Dropout2d(dropout),
             ))
         self.blocks = nn.ModuleList(blocks)
-        self.pool = nn.AdaptiveAvgPool2d((None, 1))  # collapse K, keep T
 
     @staticmethod
     def _channel_schedule(d_model: int, n_blocks: int) -> list[int]:
@@ -59,8 +57,10 @@ class LOBEncoder(nn.Module):
         for block in self.blocks:
             x = block(x)
         # x: [B, d_model, T, K]
-        x = self.pool(x)  # [B, d_model, T, 1]
-        x = x.squeeze(3)  # [B, d_model, T]
+        # Mean over K rather than AdaptiveAvgPool2d: identical result, but the
+        # pooling op has no deterministic CUDA backward and the trainer runs with
+        # deterministic algorithms on.
+        x = x.mean(dim=3)  # [B, d_model, T]
         x = x.permute(0, 2, 1)  # [B, T, d_model]
         return x
 

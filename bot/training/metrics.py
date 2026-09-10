@@ -1,19 +1,23 @@
-import torch
 from torch import Tensor
 
 
 def compute_metrics(
     logits: Tensor,
     targets: Tensor,
-    flat_mask: Tensor,
+    valid: Tensor,
     n_classes: int = 3,
 ) -> dict[str, float]:
-    """Per-horizon F1 (macro) and accuracy, excluding flat-masked samples.
+    """Per-horizon F1 (macro) and accuracy over the rows that carry a label.
+
+    Scored across all three classes, flat included: a model that predicts flat
+    when the move is genuinely below threshold is right, and a macro F1 that
+    ignored those rows would rate a model that can only pick a direction as
+    highly as one that knows when not to.
 
     Args:
         logits:    [B, H, C]
         targets:   [B, H] int64
-        flat_mask: [B, H] bool — True = flat, exclude
+        valid:     [B] or [B, H] bool — False = no usable label, exclude
         n_classes: number of classes
 
     Returns:
@@ -21,7 +25,8 @@ def compute_metrics(
     """
     preds = logits.argmax(dim=-1)  # [B, H]
     H = targets.shape[1]
-    mask = ~flat_mask  # True = keep
+    B = targets.shape[0]
+    mask = valid.view(B, 1).expand(B, H) if valid.dim() == 1 else valid
 
     metrics: dict[str, float] = {}
     f1_sum = 0.0

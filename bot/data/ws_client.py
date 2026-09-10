@@ -6,6 +6,7 @@ import structlog
 from pybit.unified_trading import WebSocket
 
 from bot.data.models import Liquidation, TickerContext, Trade
+from bot.data.observer import MarketObserver
 from bot.data.orderbook import OrderBookManager
 from bot.data.storage import StorageWriter
 
@@ -31,12 +32,14 @@ class DataIngestion:
         orderbook: OrderBookManager,
         lob_depth: int = 50,
         snapshot_interval_s: float = 0.1,
+        observer: MarketObserver | None = None,
     ) -> None:
         self._symbol = symbol
         self._storage = storage
         self._ob = orderbook
         self._lob_depth = lob_depth
         self._snapshot_interval_s = snapshot_interval_s
+        self._observer = observer
         self._ws: WebSocket | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -69,6 +72,8 @@ class DataIngestion:
             )
             if snap is not None:
                 self._storage.put_nowait(snap)
+                if self._observer is not None:
+                    self._observer.on_snapshot(snap)
             await asyncio.sleep(self._snapshot_interval_s)
 
     def stop(self) -> None:
@@ -92,7 +97,7 @@ class DataIngestion:
                 price=Decimal(t["p"]),
                 qty=Decimal(t["v"]),
             )
-            loop.call_soon_threadsafe(self._storage.put_nowait, trade)
+            loop.call_soon_threadsafe(self._handle_trade, trade)
 
     def _on_ticker(self, message: dict) -> None:
         loop = self._loop
@@ -113,7 +118,7 @@ class DataIngestion:
             turnover_24h=_dec(d.get("turnover24h")),
             collected_at_ms=_now_ms(),
         )
-        loop.call_soon_threadsafe(self._storage.put_nowait, ticker)
+        loop.call_soon_threadsafe(self._handle_ticker, ticker)
 
     def _on_liquidation(self, message: dict) -> None:
         loop = self._loop
@@ -128,7 +133,24 @@ class DataIngestion:
                 price=Decimal(event["p"]),
                 collected_at_ms=now,
             )
-            loop.call_soon_threadsafe(self._storage.put_nowait, liq)
+            loop.call_soon_threadsafe(self._handle_liquidation, liq)
+
+    # -- event-loop delivery: storage first, then the optional live consumer --
+
+    def _handle_trade(self, trade: Trade) -> None:
+        self._storage.put_nowait(trade)
+        if self._observer is not None:
+            self._observer.on_trade(trade)
+
+    def _handle_ticker(self, ticker: TickerContext) -> None:
+        self._storage.put_nowait(ticker)
+        if self._observer is not None:
+            self._observer.on_ticker(ticker)
+
+    def _handle_liquidation(self, liquidation: Liquidation) -> None:
+        self._storage.put_nowait(liquidation)
+        if self._observer is not None:
+            self._observer.on_liquidation(liquidation)
 
 
 def _now_ms() -> int:

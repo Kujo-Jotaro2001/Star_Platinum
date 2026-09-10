@@ -1,3 +1,4 @@
+from bot.inference.accumulator import TradeAccumulator
 from bot.inference.buffer import RingBuffer
 from bot.inference.predictor import (
     InferencePredictor,
@@ -13,5 +14,6 @@ __all__ = [
     "OnlineFeatureFrame",
     "OnlinePreprocessor",
     "RingBuffer",
+    "TradeAccumulator",
     "load_hybrid_model_from_checkpoint",
 ]

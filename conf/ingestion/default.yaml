@@ -1,8 +1,8 @@
 # Trading symbol
-symbol: BTCUSDT
+symbol: "SOLUSDT"
 
 # Directory where daily .db files are stored
-data_dir: data
+data_dir: "data/db"
 
 # Order book
 lob_depth: 50               # levels per side stored and snapshotted

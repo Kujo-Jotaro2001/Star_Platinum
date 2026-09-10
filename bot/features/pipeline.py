@@ -12,10 +12,12 @@ from bot.features.labels import compute_labels
 from bot.features.normalizer import RollingNormalizer
 from bot.features.ob_serializer import OB_NUM_COLS, serialize_ob_snapshot
 from bot.features.replay import (
+    count_snapshots,
     find_db_files,
+    iter_snapshots,
     load_liquidations,
     load_long_short_ratio,
-    load_snapshots,
+    load_snapshot_timestamps,
     load_ticker_context,
     load_trades,
 )
@@ -69,6 +71,16 @@ def _advance_context(
     return ticker_idx, liq_idx, ls_idx
 
 
+def _memmap(path: Path, shape: tuple[int, ...], dtype) -> np.ndarray:
+    """Open an .npy on disk for writing without holding it in memory.
+
+    The LOB tensor alone is 800 bytes per snapshot, so two weeks of data is
+    ~10 GB — more than fits alongside everything else. Writing straight through
+    to the file keeps the pipeline's footprint to one day at a time.
+    """
+    return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+
+
 def run_pipeline(
     data_dir: Path,
     symbol: str,
@@ -85,10 +97,11 @@ def run_pipeline(
     liq_window_ms: int = 60_000,
     output_dir: Path | None = None,
 ) -> None:
-    """Run the full offline feature extraction pipeline.
+    """Run the offline feature extraction pipeline, one day at a time.
 
-    Reads daily SQLite files, extracts features, computes labels,
-    normalizes, and saves numpy arrays.
+    Days are processed in order and written straight into memory-mapped outputs;
+    context state carries across day boundaries, which is why the days cannot be
+    processed independently.
     """
     if label_horizons is None:
         label_horizons = [1, 5, 10]
@@ -96,89 +109,103 @@ def run_pipeline(
         output_dir = Path("data/features") / symbol
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Find and load data
     db_paths = find_db_files(data_dir, symbol, start_date, end_date)
-    logger.info("pipeline.loading", db_count=len(db_paths))
+    n = count_snapshots(db_paths)
+    logger.info("pipeline.loading", db_count=len(db_paths), snapshots=n)
+    if n == 0:
+        raise ValueError(f"no snapshots found for {symbol} in {start_date}..{end_date}")
 
-    snapshots = load_snapshots(db_paths)
-    trades = load_trades(db_paths)
-    ticker_rows = load_ticker_context(db_paths)
-    liq_rows = load_liquidations(db_paths)
-    ls_rows = load_long_short_ratio(db_paths)
-
-    n = len(snapshots)
-    logger.info("pipeline.loaded", snapshots=n, trades=len(trades),
-                ticker=len(ticker_rows), liquidations=len(liq_rows),
-                ls_ratio=len(ls_rows))
-
-    # 2. Pre-allocate arrays
-    ob_raw = np.zeros((n, ob_depth, OB_NUM_COLS), dtype=np.float32)
-    flow_raw = np.zeros((n, NUM_FLOW_FEATURES), dtype=np.float32)
-    ctx_features = np.zeros((n, NUM_CONTEXT_FEATURES), dtype=np.float32)
+    ob_raw = _memmap(output_dir / "ob_raw.npy", (n, ob_depth, OB_NUM_COLS), np.float32)
+    flow_raw = _memmap(output_dir / "flow_features.npy", (n, NUM_FLOW_FEATURES), np.float32)
+    ctx_features = _memmap(output_dir / "ctx_features.npy", (n, NUM_CONTEXT_FEATURES), np.float32)
+    top_of_book = _memmap(output_dir / "top_of_book.npy", (n, 2), np.float64)
     mid_prices = np.zeros(n, dtype=np.float64)
     timestamps_ms = np.zeros(n, dtype=np.int64)
     is_reset = np.zeros(n, dtype=bool)
 
-    # 3. Extract raw features
-    snapshot_timestamps = [s["timestamp_ms"] for s in snapshots]
-    trade_buckets = _bucket_trades(trades, snapshot_timestamps, bucket_ms)
     ctx_builder = ContextBuilder(
         oi_history_window_ms=oi_history_window_ms,
         liq_window_ms=liq_window_ms,
     )
 
-    ticker_idx, liq_idx, ls_idx = 0, 0, 0
+    offset = 0
+    for db_path in db_paths:
+        day_ts = load_snapshot_timestamps(db_path)
+        trade_buckets = _bucket_trades(load_trades([db_path]), day_ts, bucket_ms)
 
-    for i, snap in enumerate(snapshots):
-        ts = snap["timestamp_ms"]
-        timestamps_ms[i] = ts
-        is_reset[i] = bool(snap["is_reset"])
+        ticker_rows = load_ticker_context([db_path])
+        liq_rows = load_liquidations([db_path])
+        ls_rows = load_long_short_ratio([db_path])
+        ticker_idx = liq_idx = ls_idx = 0
 
-        ticker_idx, liq_idx, ls_idx = _advance_context(
-            ctx_builder, ticker_rows, liq_rows, ls_rows,
-            ticker_idx, liq_idx, ls_idx, ts,
-        )
+        for i, snap in enumerate(iter_snapshots(db_path)):
+            j = offset + i
+            ts = snap["timestamp_ms"]
+            timestamps_ms[j] = ts
+            is_reset[j] = bool(snap["is_reset"])
 
-        bids = snap["bids"]
-        asks = snap["asks"]
-        ob_raw[i] = serialize_ob_snapshot(bids, asks, ob_depth)
-        best_bid = float(bids[0][0]) if bids else 0.0
-        best_ask = float(asks[0][0]) if asks else 0.0
-        mid_prices[i] = (best_bid + best_ask) / 2
+            ticker_idx, liq_idx, ls_idx = _advance_context(
+                ctx_builder, ticker_rows, liq_rows, ls_rows,
+                ticker_idx, liq_idx, ls_idx, ts,
+            )
 
-        flow_raw[i] = extract_flow_features(trade_buckets[i])
-        ctx_features[i] = ctx_builder.snapshot(ts)
+            bids = snap["bids"]
+            asks = snap["asks"]
+            ob_raw[j] = serialize_ob_snapshot(bids, asks, ob_depth)
+            best_bid = float(bids[0][0]) if bids else 0.0
+            best_ask = float(asks[0][0]) if asks else 0.0
+            top_of_book[j] = (best_bid, best_ask)
+            mid_prices[j] = (best_bid + best_ask) / 2
 
-    logger.info("pipeline.features_extracted")
+            flow_raw[j] = extract_flow_features(trade_buckets[i])
+            ctx_features[j] = ctx_builder.snapshot(ts)
 
-    # 4. Compute labels from mid_price series
+        offset += len(day_ts)
+        logger.info("pipeline.day_done", db=db_path.name, snapshots=len(day_ts), total=offset)
+
+    logger.info("pipeline.features_extracted", n=offset)
+
+    # Saved before the remaining steps: extraction is the expensive part of the
+    # run, and losing it to a failure further down costs half an hour.
+    np.save(output_dir / "timestamps_ms.npy", timestamps_ms)
+    np.save(output_dir / "is_reset.npy", is_reset)
+    ob_raw.flush()
+    top_of_book.flush()
+
     labels, flat_mask, valid_mask = compute_labels(
         mid_prices, is_reset, horizons=label_horizons, alpha=label_alpha
     )
 
-    # 5. Normalize flow features only (LOB tensor is self-normalizing)
+    # Rows outside valid_mask — reset zones and the edges where a horizon has no
+    # room — carry label 0 by default, which the loss would otherwise train on as
+    # a confident "down". They are given the flat index so the tensor holds a real
+    # class, and `valid_mask` is what keeps them out of the loss. `flat_mask` is
+    # deliberately left alone: it means "this label is flat", which is a class to
+    # be learned, not a row to be skipped.
+    labels[~valid_mask] = 1
+    logger.info(
+        "pipeline.labels",
+        valid=int(valid_mask.sum()),
+        excluded=int((~valid_mask).sum()),
+    )
+
+    # Normalize flow features in place: fit on the train split, freeze for the rest.
     train_end = int(n * train_ratio)
     val_end = int(n * (train_ratio + val_ratio))
 
     flow_norm = RollingNormalizer(NUM_FLOW_FEATURES, window=normalizer_window)
-    flow_out = np.zeros_like(flow_raw)
-
     for i in range(train_end):
-        flow_out[i] = flow_norm.update_and_normalize(flow_raw[i])
-
+        flow_raw[i] = flow_norm.update_and_normalize(flow_raw[i])
     for i in range(train_end, n):
-        flow_out[i] = flow_norm.normalize_only(flow_raw[i])
+        flow_raw[i] = flow_norm.normalize_only(flow_raw[i])
 
     logger.info("pipeline.normalized", train=train_end, val=val_end - train_end, test=n - val_end)
 
-    # 6. Save outputs
-    np.save(output_dir / "ob_raw.npy", ob_raw)
-    np.save(output_dir / "flow_features.npy", flow_out)
-    np.save(output_dir / "ctx_features.npy", ctx_features)
+    flow_raw.flush()
+    ctx_features.flush()
     np.save(output_dir / "labels.npy", labels)
     np.save(output_dir / "flat_mask.npy", flat_mask)
-    np.save(output_dir / "timestamps_ms.npy", timestamps_ms)
-    np.save(output_dir / "is_reset.npy", is_reset)
+    np.save(output_dir / "valid_mask.npy", valid_mask)
     flow_norm.save(output_dir / "normalizer_stats.npz")
 
     logger.info("pipeline.done", output_dir=str(output_dir), n=n)

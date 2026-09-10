@@ -1,6 +1,5 @@
 import csv
 import gzip
-import io
 import json
 import sqlite3
 import zipfile
@@ -12,6 +11,7 @@ import hydra
 import requests
 import structlog
 from omegaconf import DictConfig
+from sortedcontainers import SortedDict
 
 from bot.data.storage import (
     SNAPSHOTS_DDL,
@@ -22,7 +22,8 @@ from bot.data.storage import (
 
 logger = structlog.get_logger()
 
-SOURCE_INTERVAL_MS = 10  # quote-saver native snapshot cadence
+SOURCE_INTERVAL_MS = 100  # quote-saver ob500 cadence, measured from the archives
+TRADES_BASE_URL = "https://public.bybit.com"
 
 
 def _parse_orderbook_lines(
@@ -30,12 +31,16 @@ def _parse_orderbook_lines(
     snapshot_interval_ms: int,
     lob_depth: int,
 ) -> Iterator[tuple[int, bool, str, str]]:
-    """Parse JSON lines from ob500 file → (ts, is_reset, bids_json, asks_json).
+    """Rebuild the book from the snapshot/delta stream → (ts, is_reset, bids, asks).
 
-    - Keeps every Nth snapshot where N = snapshot_interval_ms // SOURCE_INTERVAL_MS.
-    - First kept snapshot has is_reset=True.
-    - Seq regression (seq < last_seq) on a kept snapshot sets is_reset=True.
-    - Slices bids/asks to lob_depth levels.
+    Only the first message of a file is a full `snapshot`; every later line is a
+    `delta` carrying just the levels that changed, with quantity "0" meaning the
+    level is gone. Storing a delta as if it were a book would fill the database
+    with fragments, so state is carried the same way `OrderBookManager` carries
+    it live — which is also what keeps the offline and online books identical.
+
+    Emits one row per `snapshot_interval_ms`; the source itself runs at
+    `SOURCE_INTERVAL_MS`.
     """
     if snapshot_interval_ms % SOURCE_INTERVAL_MS != 0:
         raise ValueError(
@@ -44,23 +49,56 @@ def _parse_orderbook_lines(
         )
     stride = snapshot_interval_ms // SOURCE_INTERVAL_MS
 
+    bids: SortedDict = SortedDict()
+    asks: SortedDict = SortedDict()
     last_seq = 0
     first = True
+    kept = 0
+
     for i, line in enumerate(lines):
-        if i % stride != 0:
-            continue
         msg = json.loads(line)
         data = msg["data"]
-        ts = int(msg["ts"])
         seq = int(data.get("seq", 0))
 
-        is_reset = first or seq < last_seq
-        first = False
+        reset_here = msg.get("type") == "snapshot" or seq < last_seq
+        if reset_here:
+            bids.clear()
+            asks.clear()
         last_seq = seq
 
-        bids = [[str(p), str(q)] for p, q in data["b"][:lob_depth]]
-        asks = [[str(p), str(q)] for p, q in data["a"][:lob_depth]]
-        yield ts, is_reset, json.dumps(bids), json.dumps(asks)
+        _apply_levels(bids, data.get("b", ()))
+        _apply_levels(asks, data.get("a", ()))
+
+        if i % stride != 0 or not bids or not asks:
+            continue
+
+        is_reset = first or reset_here
+        first = False
+        kept += 1
+
+        yield (
+            int(msg["ts"]),
+            is_reset,
+            json.dumps(_top(bids, lob_depth, descending=True)),
+            json.dumps(_top(asks, lob_depth, descending=False)),
+        )
+
+
+def _apply_levels(side: SortedDict, levels) -> None:
+    """Apply one side of a delta. A quantity of zero removes the level."""
+    for price, qty in levels:
+        key = float(price)
+        if float(qty) == 0.0:
+            side.pop(key, None)
+        else:
+            side[key] = (price, qty)
+
+
+def _top(side: SortedDict, depth: int, descending: bool) -> list[list[str]]:
+    """Best `depth` levels as [price, qty] strings, best first."""
+    keys = side.keys()
+    chosen = reversed(keys[-depth:]) if descending else keys[:depth]
+    return [list(side[k]) for k in chosen]
 
 
 def _parse_trade_csv(
@@ -81,10 +119,11 @@ def _parse_trade_csv(
     except StopIteration:
         return
 
-    # Header detection: try to parse column 0 as int
+    # Header detection: a data row starts with a numeric timestamp. It is float
+    # seconds in Bybit's own files, so parsing it as an int would misread every
+    # data row as a header and silently drop the first trade.
     try:
-        int(first_row[0])
-        # No header — this is a data row, rewind
+        float(first_row[0])
         data_rows: Iterator[list[str]] = _chain_one(first_row, rows_iter)
     except ValueError:
         header = [c.strip() for c in first_row]
@@ -98,7 +137,9 @@ def _parse_trade_csv(
                 break
 
     for row in data_rows:
-        ts = int(row[0])
+        # Bybit writes the trade timestamp as float seconds ("1755648000.1385"),
+        # not integer milliseconds.
+        ts = int(float(row[0]) * 1000)
         side = row[2]
         qty = row[3]
         price = row[4]
@@ -125,15 +166,62 @@ def _create_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _download_orderbook(base_url: str, symbol: str, date_str: str) -> Iterator[str]:
-    url = f"{base_url}/orderbook/linear/{symbol}/{date_str}_{symbol}_ob500.data.zip"
+def raw_paths(raw_dir: Path, symbol: str, date_str: str) -> tuple[Path, Path]:
+    """Cache locations of the day's two source archives: (order book, trades).
+
+    The names match the upstream ones, which is also what
+    `hftbacktest.data.utils.bybithistmktdata.convert` expects to be handed.
+    """
+    return (
+        raw_dir / f"{date_str}_{symbol}_ob500.data.zip",
+        raw_dir / f"{symbol}{date_str}.csv.gz",
+    )
+
+
+def ensure_raw_files(
+    base_url: str,
+    raw_dir: Path,
+    symbol: str,
+    date_str: str,
+    trades_url: str = TRADES_BASE_URL,
+) -> tuple[Path, Path]:
+    """Download the day's archives unless already cached. Returns their paths."""
+    ob_path, trades_path = raw_paths(raw_dir, symbol, date_str)
+    _download_if_missing(
+        f"{base_url}/orderbook/linear/{symbol}/{date_str}_{symbol}_ob500.data.zip",
+        ob_path,
+    )
+    # Order book and trades come from different hosts: quote-saver serves the
+    # book archives, while trades live on Bybit's own public data site.
+    _download_if_missing(
+        f"{trades_url}/trading/{symbol}/{symbol}{date_str}.csv.gz",
+        trades_path,
+    )
+    return ob_path, trades_path
+
+
+def _download_if_missing(url: str, path: Path) -> None:
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+
     resp = requests.get(url, stream=True, timeout=60)
     resp.raise_for_status()
-    buf = io.BytesIO(resp.content)
-    with zipfile.ZipFile(buf) as zf:
+
+    # Download to a partial name and rename: an interrupted transfer must not be
+    # left behind looking like a complete cache entry on the next run.
+    partial = path.with_name(path.name + ".part")
+    with partial.open("wb") as f:
+        for chunk in resp.iter_content(chunk_size=1 << 20):
+            f.write(chunk)
+    partial.replace(path)
+
+
+def _read_orderbook(path: Path) -> Iterator[str]:
+    with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
         if not names:
-            raise RuntimeError(f"Empty zip at {url}")
+            raise RuntimeError(f"Empty zip: {path}")
         with zf.open(names[0]) as f:
             for raw in f:
                 line = raw.decode("utf-8").strip()
@@ -141,13 +229,10 @@ def _download_orderbook(base_url: str, symbol: str, date_str: str) -> Iterator[s
                     yield line
 
 
-def _download_trades(base_url: str, symbol: str, date_str: str) -> Iterator[str]:
-    url = f"{base_url}/trade/linear/{symbol}/{date_str}_{symbol}.csv.gz"
-    resp = requests.get(url, stream=True, timeout=60)
-    resp.raise_for_status()
-    with gzip.GzipFile(fileobj=io.BytesIO(resp.content)) as gz:
+def _read_trades(path: Path) -> Iterator[str]:
+    with gzip.open(path, "rb") as gz:
         for raw in gz:
-            line = raw.decode("utf-8").rstrip("\n\r")
+            line = raw.decode("utf-8").strip()
             if line:
                 yield line
 
@@ -156,6 +241,7 @@ def _load_day(
     symbol: str,
     day: date,
     db_dir: Path,
+    raw_dir: Path,
     snapshot_interval_ms: int,
     lob_depth: int,
     base_url: str,
@@ -168,12 +254,14 @@ def _load_day(
 
     logger.info("historical.loading_day", date=date_str, symbol=symbol)
 
+    ob_path, trades_path = ensure_raw_files(base_url, raw_dir, symbol, date_str)
+
     ob_rows = list(_parse_orderbook_lines(
-        _download_orderbook(base_url, symbol, date_str),
+        _read_orderbook(ob_path),
         snapshot_interval_ms=snapshot_interval_ms,
         lob_depth=lob_depth,
     ))
-    trade_rows = list(_parse_trade_csv(_download_trades(base_url, symbol, date_str)))
+    trade_rows = list(_parse_trade_csv(_read_trades(trades_path)))
 
     db_dir.mkdir(parents=True, exist_ok=True)
     conn = _create_db(db_path)
@@ -204,21 +292,26 @@ def load_historical_data(
     start_date: date,
     end_date: date,
     db_dir: str,
+    raw_dir: str,
     snapshot_interval_ms: int,
     lob_depth: int,
     base_url: str = "https://quote-saver.bycsi.com",
 ) -> None:
     """Download Bybit historical OB + trades into daily SQLite files.
 
-    Resumable: days whose DB file already exists are skipped.
+    Resumable: days whose DB file already exists are skipped. The source archives
+    are kept under `raw_dir` — the feature pipeline reads the downsampled SQLite,
+    while the backtest feeds the untouched archives straight to hftbacktest.
     """
     db_dir_path = Path(db_dir)
+    raw_dir_path = Path(raw_dir)
     day = start_date
     while day <= end_date:
         _load_day(
             symbol=symbol,
             day=day,
             db_dir=db_dir_path,
+            raw_dir=raw_dir_path,
             snapshot_interval_ms=snapshot_interval_ms,
             lob_depth=lob_depth,
             base_url=base_url,
@@ -233,6 +326,7 @@ def main(cfg: DictConfig) -> None:
         start_date=date.fromisoformat(cfg.historical.start_date),
         end_date=date.fromisoformat(cfg.historical.end_date),
         db_dir=cfg.ingestion.data_dir,
+        raw_dir=cfg.historical.raw_dir,
         snapshot_interval_ms=cfg.historical.snapshot_interval_ms,
         lob_depth=cfg.ingestion.lob_depth,
         base_url=cfg.historical.base_url,

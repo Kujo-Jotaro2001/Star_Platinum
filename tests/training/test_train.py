@@ -1,8 +1,10 @@
+import numpy as np
+import pytest
 import torch
 
 from bot.models.hybrid import HybridSignalModel
 from bot.training.losses import MultiHorizonLoss
-from bot.training.train import SignalLitModule
+from bot.training.train import SignalLitModule, _compute_class_weights
 
 B, T, K = 2, 10, 50
 H, C = 3, 3
@@ -15,6 +17,7 @@ def _make_batch(use_ctx: bool = True) -> dict[str, torch.Tensor]:
         "ctx": torch.randn(B, T, 17) if use_ctx else torch.zeros(B, T, 17),
         "labels": torch.randint(0, C, (B, H)),
         "flat_mask": torch.zeros(B, H, dtype=torch.bool),
+        "valid": torch.ones(B, dtype=torch.bool),
     }
 
 
@@ -55,3 +58,55 @@ class TestSignalLitModule:
         module = _make_module()
         optim = module.configure_optimizers()
         assert isinstance(optim, torch.optim.AdamW)
+
+
+class TestClassWeights:
+    """Weighting runs over the rows that carry a label, across all three classes."""
+
+    def test_flat_is_weighted_like_any_other_class(self) -> None:
+        """It is the majority class at every horizon, so leaving it unweighted
+        while it is in the loss would let it dominate."""
+        labels = np.array([[0], [2], [1], [1], [1]], dtype=np.int8)
+        valid = np.ones(5, dtype=bool)
+        w = _compute_class_weights(labels, valid, 3)
+        assert w[1].item() < w[0].item()
+
+    def test_absent_class_gets_a_neutral_weight(self) -> None:
+        labels = np.array([[0], [2], [0], [2]], dtype=np.int8)
+        valid = np.ones(4, dtype=bool)
+        w = _compute_class_weights(labels, valid, 3)
+        assert w[1].item() == pytest.approx(1.0)
+
+    def test_balanced_classes_get_equal_weights(self) -> None:
+        labels = np.array([[0], [2], [0], [2]], dtype=np.int8)
+        valid = np.ones(4, dtype=bool)
+        w = _compute_class_weights(labels, valid, 3)
+        assert w[0].item() == pytest.approx(w[2].item())
+        assert w[0].item() == pytest.approx(1.0)
+
+    def test_rarer_class_gets_the_larger_weight(self) -> None:
+        labels = np.array([[0]] * 9 + [[2]], dtype=np.int8)
+        valid = np.ones(10, dtype=bool)
+        w = _compute_class_weights(labels, valid, 3)
+        assert w[2].item() > w[0].item()
+
+    def test_invalid_rows_do_not_count(self) -> None:
+        labels = np.array([[0]] * 9 + [[2]], dtype=np.int8)
+        valid = np.ones(10, dtype=bool)
+        valid[:8] = False  # one 0 and one 2 left, so the two balance
+        w = _compute_class_weights(labels, valid, 3)
+        assert w[0].item() == pytest.approx(w[2].item())
+
+    def test_active_weights_average_to_one(self) -> None:
+        labels = np.array([[0]] * 7 + [[2]] * 3, dtype=np.int8)
+        valid = np.ones(10, dtype=bool)
+        w = _compute_class_weights(labels, valid, 3).numpy()
+        counts = np.array([7, 0, 3])
+        present = counts > 0
+        assert float((w[present] * counts[present]).sum() / counts.sum()) == pytest.approx(1.0, rel=1e-5)
+
+    def test_no_usable_labels_leaves_every_weight_neutral(self) -> None:
+        labels = np.ones((5, 1), dtype=np.int8)
+        valid = np.zeros(5, dtype=bool)
+        w = _compute_class_weights(labels, valid, 3)
+        assert np.allclose(w.numpy(), 1.0)

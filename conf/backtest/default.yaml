@@ -1,0 +1,40 @@
+split: test                  # train | val | test
+checkpoint_path: null        # required — Lightning .ckpt produced by bot.training.train
+device: auto
+initial_equity: 10000.0    # hftbacktest starts at zero balance; the risk gate needs a real one
+batch_size: 512
+
+# hftbacktest feed files converted from the cached bycsi archives
+feed_dir: "data/hft"
+report_dir: "data/reports"   # record.npz + run.json + report.html land here per run
+prediction_cache_dir: "data/predictions"  # model scores keyed by checkpoint+split
+tag: null                    # suffix for the run directory, so a sweep keeps every run
+recorder_buffer_size: 10000000
+
+# Bybit USDT-perp rates as fractions of traded value.
+#
+# Confirmed VIP0 (standard account, no market-maker programme): maker is +0.02%,
+# a cost, not a rebate -- only the MM programme gets a negative maker rate, and
+# this account is not on it. Every earlier note in this project calling maker a
+# "rebate" was wrong; it assumed the MM rate without checking the account tier.
+maker_fee_rate: 0.0002
+taker_fee_rate: 0.00055
+
+# Queue position model: risk_adverse | log_prob | power_prob | power_prob2 | power_prob3
+queue_model: power_prob3
+queue_power: 3.0
+
+# Order latency: intp (interpolated from the generated latency files) | constant
+latency_model: intp
+entry_latency_ns: 10000000     # constant model only — 10 ms
+response_latency_ns: 10000000
+
+# Bybit public history carries no local timestamp, so feed latency is assumed,
+# not measured. Order latency is derived from it as mul * feed_latency + offset.
+# Replace with a latency file collected on Demo before trusting fill rates.
+feed_latency_ns: 10000000      # 10 ms
+base_latency_ns: 0
+mul_entry: 1.0
+offset_entry_ns: 0
+mul_resp: 1.0
+offset_resp_ns: 0

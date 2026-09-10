@@ -26,8 +26,13 @@ class SignalLitModule(pl.LightningModule):
         weight_decay: float,
         use_ctx: bool,
         n_classes: int,
+        arch: dict | None = None,
     ) -> None:
         super().__init__()
+        # The architecture travels with the weights, so a checkpoint can be
+        # loaded without also being told how it was built. `model` and `loss_fn`
+        # are live modules and are saved by Lightning as weights already.
+        self.save_hyperparameters({"arch": arch or {}})
         self.model = model
         self.loss_fn = loss_fn
         self._lr = lr
@@ -44,7 +49,7 @@ class SignalLitModule(pl.LightningModule):
             batch["flow"],
             batch["ctx"] if self._use_ctx else None,
         )
-        loss = self.loss_fn(logits, batch["labels"], batch["flat_mask"])
+        loss = self.loss_fn(logits, batch["labels"], batch["valid"])
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
@@ -54,11 +59,11 @@ class SignalLitModule(pl.LightningModule):
             batch["flow"],
             batch["ctx"] if self._use_ctx else None,
         )
-        loss = self.loss_fn(logits, batch["labels"], batch["flat_mask"])
+        loss = self.loss_fn(logits, batch["labels"], batch["valid"])
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
 
         metrics = compute_metrics(
-            logits, batch["labels"], batch["flat_mask"], self._n_classes,
+            logits, batch["labels"], batch["valid"], self._n_classes,
         )
         for k, v in metrics.items():
             self.log(f"val_{k}", v, prog_bar=(k == "f1_macro"), sync_dist=True)
@@ -70,7 +75,7 @@ class SignalLitModule(pl.LightningModule):
             batch["ctx"] if self._use_ctx else None,
         )
         metrics = compute_metrics(
-            logits, batch["labels"], batch["flat_mask"], self._n_classes,
+            logits, batch["labels"], batch["valid"], self._n_classes,
         )
         for k, v in metrics.items():
             self.log(f"test_{k}", v, sync_dist=True)
@@ -83,13 +88,25 @@ class SignalLitModule(pl.LightningModule):
         )
 
 
-def _compute_class_weights(labels: np.ndarray, flat_mask: np.ndarray, n_classes: int) -> Tensor:
-    """Inverse-frequency class weights from non-flat train labels."""
-    mask = ~flat_mask  # [N, H]
-    valid_labels = labels[mask]
+def _compute_class_weights(
+    labels: np.ndarray, valid_mask: np.ndarray, n_classes: int
+) -> Tensor:
+    """Inverse-frequency class weights over the rows that carry a label.
+
+    All three classes are counted, flat included — it is the majority class at
+    every horizon, and leaving it out of the weighting while it is in the loss
+    would let it dominate. A class with no examples at all keeps a weight of 1
+    rather than a derived one: dividing by a zero count yields a multiplier in
+    the millions. Normalisation runs over the classes that are present, so the
+    active weights average to one.
+    """
+    valid_labels = labels[valid_mask].ravel()
     counts = np.bincount(valid_labels, minlength=n_classes).astype(np.float64)
-    counts = np.maximum(counts, 1.0)
-    weights = counts.sum() / (n_classes * counts)
+    present = counts > 0
+
+    weights = np.ones(n_classes, dtype=np.float64)
+    if present.any():
+        weights[present] = counts[present].sum() / (present.sum() * counts[present])
     return torch.from_numpy(weights).float()
 
 
@@ -103,11 +120,13 @@ def main(cfg: DictConfig) -> None:
 
     logger.info("train.loading_data", features_dir=str(features_dir))
 
-    ob_raw = np.load(features_dir / "ob_raw.npy")
-    flow = np.load(features_dir / "flow_features.npy")
-    ctx = np.load(features_dir / "ctx_features.npy")
+    # Memory-mapped: the LOB tensor alone is ~10 GB for a two-week range.
+    ob_raw = np.load(features_dir / "ob_raw.npy", mmap_mode="r")
+    flow = np.load(features_dir / "flow_features.npy", mmap_mode="r")
+    ctx = np.load(features_dir / "ctx_features.npy", mmap_mode="r")
     labels = np.load(features_dir / "labels.npy")
     flat_mask = np.load(features_dir / "flat_mask.npy")
+    valid_mask = np.load(features_dir / "valid_mask.npy")
 
     N = len(ob_raw)
     train_end = int(N * cfg.features.train_ratio)
@@ -118,24 +137,33 @@ def main(cfg: DictConfig) -> None:
     use_ctx: bool = cfg.model.use_ctx
     seq_len: int = cfg.model.seq_len
 
+    stride: int = cfg.train.window_stride
     train_ds = LOBDataset(ob_raw[:train_end], flow[:train_end], ctx[:train_end],
-                          labels[:train_end], flat_mask[:train_end], seq_len, use_ctx)
+                          labels[:train_end], flat_mask[:train_end], seq_len, use_ctx,
+                          stride=stride, valid_mask=valid_mask[:train_end])
     val_ds = LOBDataset(ob_raw[train_end:val_end], flow[train_end:val_end],
                         ctx[train_end:val_end], labels[train_end:val_end],
-                        flat_mask[train_end:val_end], seq_len, use_ctx)
+                        flat_mask[train_end:val_end], seq_len, use_ctx, stride=stride,
+                        valid_mask=valid_mask[train_end:val_end])
     test_ds = LOBDataset(ob_raw[val_end:], flow[val_end:], ctx[val_end:],
-                         labels[val_end:], flat_mask[val_end:], seq_len, use_ctx)
+                         labels[val_end:], flat_mask[val_end:], seq_len, use_ctx,
+                         stride=stride, valid_mask=valid_mask[val_end:])
+    logger.info("train.windows", train=len(train_ds), val=len(val_ds), test=len(test_ds),
+                stride=stride)
 
     batch_size: int = cfg.train.batch_size
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                          num_workers=4, persistent_workers=True, pin_memory=True)
+                          num_workers=cfg.train.num_workers, persistent_workers=cfg.train.num_workers > 0,
+                          pin_memory=True)
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                        num_workers=4, persistent_workers=True, pin_memory=True)
+                        num_workers=cfg.train.num_workers, persistent_workers=cfg.train.num_workers > 0,
+                          pin_memory=True)
     test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                         num_workers=4, persistent_workers=True, pin_memory=True)
+                         num_workers=cfg.train.num_workers, persistent_workers=cfg.train.num_workers > 0,
+                          pin_memory=True)
 
     class_weights = _compute_class_weights(
-        labels[:train_end], flat_mask[:train_end], cfg.model.n_classes,
+        labels[:train_end], valid_mask[:train_end], cfg.model.n_classes,
     )
     logger.info("train.class_weights", weights=class_weights.tolist())
 
@@ -168,6 +196,20 @@ def main(cfg: DictConfig) -> None:
         weight_decay=cfg.train.weight_decay,
         use_ctx=use_ctx,
         n_classes=cfg.model.n_classes,
+        arch={
+            "ob_depth": cfg.model.ob_depth,
+            "d_model": cfg.model.d_model,
+            "d_ctx": cfg.model.d_ctx,
+            "n_lob_blocks": cfg.model.n_lob_blocks,
+            "in_features_flow": cfg.model.in_features_flow,
+            "in_features_ctx": cfg.model.in_features_ctx,
+            "flow_encoder": cfg.model.flow_encoder,
+            "gru_layers": cfg.model.gru_layers,
+            "n_classes": cfg.model.n_classes,
+            "n_horizons": n_horizons,
+            "dropout": cfg.model.dropout,
+            "use_ctx": use_ctx,
+        },
     )
 
     callbacks = [
@@ -175,7 +217,9 @@ def main(cfg: DictConfig) -> None:
             monitor=cfg.train.val_metric,
             mode="max",
             save_top_k=1,
-            filename="best-{epoch}-{val_f1_macro:.4f}",
+            # No "=" in the name: it is a valid filename but Hydra reads it as
+            # override syntax, so the checkpoint cannot be passed back on the CLI.
+            filename="best-epoch{epoch:02d}-f1{val_f1_macro:.4f}",
         ),
         pl.callbacks.EarlyStopping(
             monitor=cfg.train.val_metric,

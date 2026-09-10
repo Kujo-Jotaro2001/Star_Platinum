@@ -157,6 +157,13 @@ class InferencePredictor:
         )
 
 
+ARCH_KEYS = (
+    "ob_depth", "d_model", "d_ctx", "n_lob_blocks", "in_features_flow",
+    "in_features_ctx", "flow_encoder", "gru_layers", "n_classes", "n_horizons",
+    "dropout", "use_ctx",
+)
+
+
 def load_hybrid_model_from_checkpoint(
     checkpoint_path: Path,
     device: str | torch.device,
@@ -173,25 +180,38 @@ def load_hybrid_model_from_checkpoint(
     dropout: float,
     use_ctx: bool,
 ) -> HybridSignalModel:
-    model = HybridSignalModel(
-        ob_depth=ob_depth,
-        d_model=d_model,
-        d_ctx=d_ctx,
-        n_lob_blocks=n_lob_blocks,
-        in_features_flow=in_features_flow,
-        in_features_ctx=in_features_ctx,
-        flow_encoder=flow_encoder,
-        gru_layers=gru_layers,
-        n_classes=n_classes,
-        n_horizons=n_horizons,
-        dropout=dropout,
-        use_ctx=use_ctx,
-    )
+    """Rebuild the trained model.
+
+    The arguments describe the architecture to build, but a checkpoint that
+    recorded its own takes precedence: the weights are the ground truth about
+    what was trained, and disagreeing with them surfaces as a `load_state_dict`
+    shape mismatch that names tensors rather than the setting that differs.
+    Checkpoints written before the architecture was recorded fall back to the
+    arguments, so `cfg.model` must still match those.
+    """
     checkpoint = torch.load(
         checkpoint_path,
         map_location=_resolve_device(device),
         weights_only=False,
     )
+    arch = {
+        "ob_depth": ob_depth,
+        "d_model": d_model,
+        "d_ctx": d_ctx,
+        "n_lob_blocks": n_lob_blocks,
+        "in_features_flow": in_features_flow,
+        "in_features_ctx": in_features_ctx,
+        "flow_encoder": flow_encoder,
+        "gru_layers": gru_layers,
+        "n_classes": n_classes,
+        "n_horizons": n_horizons,
+        "dropout": dropout,
+        "use_ctx": use_ctx,
+    }
+    recorded = (checkpoint.get("hyper_parameters") or {}).get("arch") or {}
+    arch.update({k: v for k, v in recorded.items() if k in ARCH_KEYS})
+
+    model = HybridSignalModel(**arch)
     state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
     model.load_state_dict(_model_state_dict(state_dict))
     model.eval()

@@ -1,0 +1,24 @@
+order_notional: 100.0
+entry_order_type: PostOnly   # PostOnly | Market
+exit_order_type: PostOnly    # passive first; crossed on fallback so it still fills
+order_timeout_ms: 1000       # cancel an unfilled post-only entry after this
+# Measured on the val split: at 2000 ms the strategy loses 0.81 bps a trade, at
+# 10000 ms it loses 0.04. A passive exit that is given time to work is the single
+# largest term in the P&L — crossing costs 5.5 bps taker against 2 bps maker at
+# this account's VIP0 tier (no rebate — see conf/backtest/default.yaml), which
+# is more than the whole 10 s move being traded.
+exit_fallback_ms: 10000      # a resting exit is crossed after resting this long
+exit_repeg: true             # follow the book with the passive exit instead of letting it strand
+cross_on_stop: false         # a stop breach alone does not justify paying the taker fee
+hold_snapshots: null         # null → features.label_horizons[signals.horizon_index]
+take_profit_bps: 5.0     # ~1.4 sigma of the 10 s move on SOL
+stop_loss_bps: 5.0
+
+# SOLUSDT rounding rules — GET /v5/market/instruments-info
+qty_step: 0.1
+price_tick: 0.01
+min_order_qty: 0.1
+
+demo: true                   # Bybit Demo — real market data, virtual funds
+
+dry_run: false               # true → log the intents, place nothing

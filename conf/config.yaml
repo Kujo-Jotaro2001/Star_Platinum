@@ -7,6 +7,9 @@ defaults:
   - signals: default
   - risk: default
   - inference: default
+  - execution: default
+  - backtest: default
+  - telemetry: default
   - _self_
 
 hydra:

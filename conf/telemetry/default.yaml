@@ -1,0 +1,2 @@
+rollup_interval_s: 60.0     # how often the window summary is logged
+window_capacity: 4096       # samples kept per quantile gauge (~7 min at 10 Hz)

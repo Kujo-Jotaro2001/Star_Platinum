@@ -4,6 +4,7 @@ import time
 from pybit.unified_trading import HTTP
 
 from bot.data.models import LongShortRatio
+from bot.data.observer import MarketObserver
 from bot.data.storage import StorageWriter
 
 
@@ -26,6 +27,7 @@ async def poll_long_short_ratio(
     symbol: str,
     shutdown: asyncio.Event,
     interval_s: float = 900.0,
+    observer: MarketObserver | None = None,
 ) -> None:
     last_ts: int | None = None
 
@@ -42,12 +44,15 @@ async def poll_long_short_ratio(
             latest = items[0]
             ts = int(latest["timestamp"])
             if last_ts is None or ts > last_ts:
-                storage.put_nowait(LongShortRatio(
+                ratio = LongShortRatio(
                     timestamp_ms=ts,
                     buy_ratio=latest["buyRatio"],
                     sell_ratio=latest["sellRatio"],
                     collected_at_ms=_now_ms(),
-                ))
+                )
+                storage.put_nowait(ratio)
+                if observer is not None:
+                    observer.on_long_short_ratio(ratio)
                 last_ts = ts
 
         if await _sleep_or_stop(shutdown, interval_s):

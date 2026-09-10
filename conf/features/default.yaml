@@ -1,6 +1,6 @@
 # Date range to process (override on CLI: features.start_date=2026-04-11)
-start_date: "2026-04-11"
-end_date: "2026-04-11"
+start_date: "2025-08-07"
+end_date: "2025-08-20"
 
 # Trade flow
 bucket_ms: 100              # trade flow bucket width, aligned to snapshot timestamps
@@ -13,8 +13,8 @@ val_ratio: 0.1              # test_ratio = 1 - train_ratio - val_ratio = 0.1
 normalizer_window: 500      # rolling window size for mean/std
 
 # Labels
-label_alpha: 0.001          # flat-band threshold: |ret| < alpha → class 1 (flat)
-label_horizons: [1, 5, 10]  # prediction horizons in snapshots
+label_alpha: 0.0001        # 1 bps — measured to give ~31/38/32 at the 10s horizon on SOL
+label_horizons: [50, 100, 300]   # 5s / 10s / 30s at the 100ms cadence
 
 # Context feature windows
 oi_history_window_ms: 3600000   # 1 hour — lookback for oi_change_pct_1h

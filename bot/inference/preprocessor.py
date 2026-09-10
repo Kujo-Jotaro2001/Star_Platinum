@@ -46,6 +46,14 @@ class OnlinePreprocessor:
             and self._ctx_buffer.is_full
         )
 
+    def context_ages_ms(self, now_ms: int) -> tuple[int, int, int]:
+        """Age of the last ticker, liquidation and ratio update.
+
+        Context features are forward-filled forever, so this is the only signal
+        that a source has gone silent.
+        """
+        return self._ctx_builder.source_ages_ms(now_ms)
+
     def update_ticker(self, row: dict) -> None:
         self._ctx_builder.update_ticker(row)
 
